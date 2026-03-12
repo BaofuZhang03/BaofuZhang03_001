@@ -31,7 +31,7 @@ from utils.encrypt import verify_param
 # =====================================================================
 
 USERNAME      = ""                    # 超星账号
-PASSWORD      = ""
+PASSWORD      = "."
 
 ROOM_ID       = "11386"               # 房间 roomId
 SEAT_PAGE_ID  = "11386"               # URL 中 seatId= 的值（seatPageId）
@@ -47,20 +47,19 @@ RESERVE_NEXT_DAY = True               # True = 预约明天
 
 # ── 目标时间（北京时间 HH:MM:SS）──────────────────────────────────────
 # 脚本会等到这个时刻再开始计时，留出足够时间完成登录
-TARGET_TIME = "23:12:00"             # 改成你想测试的时刻
+TARGET_TIME = "19:05:00"             # 改成你想测试的时刻
 
 # ── token 提前量（ms）────────────────────────────────────────────────
 # 在 target_dt - PRE_FETCH_MS 时刻获取 token，通过改这个值探测 TTL 边界
-PRE_FETCH_MS = 1500                   # 例：60000 = 提前 60 秒
+PRE_FETCH_MS = 6000                   # 例：60000 = 提前 60 秒
 
 # ── 各 Shot 相对 target_dt 的触发偏移（ms）──────────────────────────
 # 格式：(offset_ms, seat_num, label)
 # Shot 1 故意用 WRONG_SEAT，后续用 CORRECT_SEAT
 SHOTS = [
-    (200,  WRONG_SEAT,   "WRONG"),    # Shot 1: 错误参数，消耗一次 token
-    (1000, CORRECT_SEAT, "CORRECT"),  # Shot 2: 正确参数，验证 token 是否还有效
-    (1300, CORRECT_SEAT, "CORRECT"),  # Shot 3: 保底
-    (5000, CORRECT_SEAT, "CORRECT"),  # Shot 4: 5s 后再试一次（拉长间隔测 TTL）
+    (200,  CORRECT_SEAT, "CORRECT"),   # Shot 1: T+200ms
+    (800,  CORRECT_SEAT, "CORRECT"),   # Shot 2: T+800ms
+    (1000, CORRECT_SEAT, "CORRECT"),   # Shot 3: T+1000ms
 ]
 
 # =====================================================================

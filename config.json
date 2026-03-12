@@ -85,7 +85,7 @@
         "target_offset3_ms": 140,
 
         "_comment_burst_offsets_ms": "[仅 burst] 各枪相对目标时间 T 的发射时刻（毫秒列表）。",
-        "burst_offsets_ms": [221, 475, 670]
+        "burst_offsets_ms": [422, 815, 1180]
     },
 
     "_comment_tulingcloud": "图灵云打码平台配置（可选，用于本地开发测试，GitHub Actions 中从 secrets 读取）",
