@@ -1,17 +1,17 @@
 // worker2.js
 // 独立兜底 Worker：通过 Cloudflare KV REST API 跨账号读取 tongyi 的心跳 KV，并用小时锁避免重复兜底
 
-function beijingNow() {
-  return new Date(Date.now() + 8 * 3600 * 1000);
+function beijingNow(baseTimestampMs = Date.now()) {
+  return new Date(baseTimestampMs + 8 * 3600 * 1000);
 }
 
-function beijingHHMM() {
-  const d = beijingNow();
+function beijingHHMM(baseTimestampMs = Date.now()) {
+  const d = beijingNow(baseTimestampMs);
   return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
 }
 
-function beijingHMS() {
-  const d = beijingNow();
+function beijingHMS(baseTimestampMs = Date.now()) {
+  const d = beijingNow(baseTimestampMs);
   return [
     String(d.getUTCHours()).padStart(2, "0"),
     String(d.getUTCMinutes()).padStart(2, "0"),
@@ -19,8 +19,8 @@ function beijingHMS() {
   ].join(":");
 }
 
-function beijingDateMinute(offsetMinutes = 0) {
-  const d = new Date(Date.now() + (8 * 3600 + offsetMinutes * 60) * 1000);
+function beijingDateMinute(offsetMinutes = 0, baseTimestampMs = Date.now()) {
+  const d = new Date(baseTimestampMs + (8 * 3600 + offsetMinutes * 60) * 1000);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
@@ -46,8 +46,8 @@ const HEARTBEAT_CONFIRM_DELAY_MS = 8000;
 const FALLBACK_HOUR_LOCK_PREFIX = "meta:fallback_hour_lock";
 const FALLBACK_HOUR_LOCK_TTL_SECONDS = 48 * 60 * 60;
 
-function beijingDateHour() {
-  const d = beijingNow();
+function beijingDateHour(baseTimestampMs = Date.now()) {
+  const d = beijingNow(baseTimestampMs);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
@@ -139,16 +139,36 @@ async function getHeartbeatState(env) {
   return { heartbeatTs, heartbeatMinuteSlot };
 }
 
-function isHeartbeatSlotHealthy(heartbeatMinuteSlot) {
+function isHeartbeatSlotHealthy(heartbeatMinuteSlot, baseTimestampMs = Date.now()) {
   if (!heartbeatMinuteSlot) return false;
-  return heartbeatMinuteSlot === beijingDateMinute(0) || heartbeatMinuteSlot === beijingDateMinute(-1);
+  return (
+    heartbeatMinuteSlot === beijingDateMinute(0, baseTimestampMs) ||
+    heartbeatMinuteSlot === beijingDateMinute(-1, baseTimestampMs)
+  );
 }
 
-function getExpectedHeartbeatSlots() {
+function isHeartbeatFreshByTimestamp(heartbeatTs, diffMs) {
+  return heartbeatTs !== null && diffMs !== null && diffMs <= HEARTBEAT_TIMEOUT_MS;
+}
+
+function getExpectedHeartbeatSlots(baseTimestampMs = Date.now()) {
   return {
-    current: beijingDateMinute(0),
-    previous: beijingDateMinute(-1),
+    current: beijingDateMinute(0, baseTimestampMs),
+    previous: beijingDateMinute(-1, baseTimestampMs),
   };
+}
+
+function normalizeScheduledTimeMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
 }
 
 function buildFallbackHourLockKey(hourKey) {
@@ -415,7 +435,8 @@ async function triggerDueSchools(env, options = {}, dueSchools = null) {
 
 async function runWatchdog(env, options = {}) {
   const nowIso = new Date().toISOString();
-  const hourKey = beijingDateHour();
+  const referenceTimeMs = options.referenceTimeMs ?? Date.now();
+  const hourKey = beijingDateHour(referenceTimeMs);
   let heartbeatTs = null;
   let heartbeatMinuteSlot = null;
   try {
@@ -446,10 +467,11 @@ async function runWatchdog(env, options = {}) {
   }
   let diffMs = heartbeatTs === null ? null : Math.max(0, Date.now() - heartbeatTs);
   let diffSeconds = diffMs === null ? null : Math.floor(diffMs / 1000);
-  let expectedSlots = getExpectedHeartbeatSlots();
-  let isStale = heartbeatMinuteSlot
-    ? !isHeartbeatSlotHealthy(heartbeatMinuteSlot)
-    : heartbeatTs === null || diffMs > HEARTBEAT_TIMEOUT_MS;
+  let expectedSlots = getExpectedHeartbeatSlots(referenceTimeMs);
+  let isStale = !(
+    isHeartbeatSlotHealthy(heartbeatMinuteSlot, referenceTimeMs) ||
+    isHeartbeatFreshByTimestamp(heartbeatTs, diffMs)
+  );
   let heartbeatRecheck = null;
   const fallbackOptions = {
     triggerSource: "worker2",
@@ -477,10 +499,11 @@ async function runWatchdog(env, options = {}) {
       heartbeatMinuteSlot = recheckedHeartbeatMinuteSlot;
       diffMs = recheckedDiffMs;
       diffSeconds = recheckedDiffSeconds;
-      expectedSlots = getExpectedHeartbeatSlots();
-      isStale = heartbeatMinuteSlot
-        ? !isHeartbeatSlotHealthy(heartbeatMinuteSlot)
-        : heartbeatTs === null || diffMs > HEARTBEAT_TIMEOUT_MS;
+      expectedSlots = getExpectedHeartbeatSlots(referenceTimeMs);
+      isStale = !(
+        isHeartbeatSlotHealthy(heartbeatMinuteSlot, referenceTimeMs) ||
+        isHeartbeatFreshByTimestamp(heartbeatTs, diffMs)
+      );
     } catch (e) {
       heartbeatRecheck = {
         delayMs: HEARTBEAT_CONFIRM_DELAY_MS,
@@ -635,7 +658,7 @@ async function runWatchdog(env, options = {}) {
   const preNotification = await sendFeishuText(
     env,
     [
-      "worker2 告警：检测到 tongyi 心跳超时，准备执行兜底任务。",
+      "worker2 告警：检测到 tongyi 心跳异常，准备执行兜底任务。",
       `期望心跳分钟槽位: ${expectedHeartbeatLabel}`,
       `最近心跳分钟槽位: ${heartbeatMinuteLabel}`,
       recheckHeartbeatMinuteLabel ? `复查心跳分钟槽位: ${recheckHeartbeatMinuteLabel}` : "",
@@ -664,7 +687,7 @@ async function runWatchdog(env, options = {}) {
   const notifications = await sendFeishuAlerts(
     env,
     formatFallbackMessages(
-      "worker2 告警：tongyi 心跳超时，已执行兜底触发。",
+      "worker2 告警：tongyi 心跳异常，已执行兜底触发。",
       [
       `期望心跳分钟槽位: ${expectedHeartbeatLabel}`,
       `最近心跳分钟槽位: ${heartbeatMinuteLabel}`,
@@ -707,7 +730,10 @@ async function runWatchdog(env, options = {}) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runWatchdog(env, { manual: false }));
+    const referenceTimeMs = normalizeScheduledTimeMs(
+      event?.scheduledTime ?? event?.scheduledTimeMs ?? event?.cronTime
+    ) ?? Date.now();
+    ctx.waitUntil(runWatchdog(env, { manual: false, referenceTimeMs }));
   },
 
   async fetch(request, env, ctx) {

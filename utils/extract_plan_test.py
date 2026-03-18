@@ -1,5 +1,32 @@
 import re
 
+TEST_TEXT = """
+自习室id:13475
+座位号:655
+时间段:
+时间段：
+周一:9:30-21:30
+周二:9:30-21:30
+周三:9:30-21:30
+周四:9:30-21:30
+周五:9:30-21:30
+周六:9:30-21:30
+周日:9:30-21:30
+""".strip()
+
+
+"""
+周一:8:00-22:00
+周二:8:00-22:00
+周三:8:00-22:00
+周四:8:00-22:00
+周五:8:00-22:00
+周六:8:00-22:00
+周日:8:00-22:00
+周天:8:00-22:00
+"""
+
+
 def extract_plan(text):
     # 提取roomid和seatid
     # 全局提取 roomid 和 seatid，避免受空行影响
@@ -77,9 +104,7 @@ def extract_plan(text):
     return plans
 
 if __name__ == "__main__":
-    print("请输入原始文本，结束后按Ctrl+D：")
-    import sys
     import json
-    text = sys.stdin.read()
-    result = extract_plan(text)
+
+    result = extract_plan(TEST_TEXT)
     print(json.dumps(result, ensure_ascii=False, indent=2))

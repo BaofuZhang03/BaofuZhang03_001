@@ -150,6 +150,7 @@ test_*.py
 switch_remote.py
 auto_commit.sh
 extract_room_ids.py
+sync_shared_files.py
 
 # Cloudflare Workers 本地缓存
 workers/**/.wrangler/
