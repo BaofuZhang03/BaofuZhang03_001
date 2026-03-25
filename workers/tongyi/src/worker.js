@@ -1490,11 +1490,11 @@ async function handleAPI(request, env, path) {
       : [{ roomid: daySchedule.roomid, seatid: daySchedule.seatid, times: daySchedule.times, seatPageId: daySchedule.seatPageId || "", fidEnc: daySchedule.fidEnc || "" }];
     const activeSlots = rawSlots.filter(s => s.times && s.roomid);
     if (activeSlots.length === 0) return jsonResp({ error: "No active slots for today" }, 400);
-    const payload = {
+    const dispatchUser = {
       username: user.phone || user.username,
       password: user.password,
       remark: user.remark || user.username || user.phone,
-      trigger_date: beijingDate(),
+      nickname: user.username,
       slots: activeSlots.map(s => ({
         roomid: s.roomid,
         seatid: (s.seatid || "").split(",").map(x => x.trim()).filter(Boolean),
@@ -1502,32 +1502,26 @@ async function handleAPI(request, env, path) {
         seatPageId: s.seatPageId || "",
         fidEnc: school.fidEnc || s.fidEnc || "",
       })),
-      endtime: school.endtime,
-      seat_api_mode: school.seat_api_mode || "seat",
-      reserve_next_day: school.reserve_next_day !== false,
-      enable_slider: !!school.enable_slider,
-      enable_textclick: !!school.enable_textclick,
-      strategy: randomizeStrategy(school.strategy),
     };
-    const dispatchToken = resolveGitHubToken(env, school);
-    if (!dispatchToken) {
+    const result = await dispatchUsersInBatches(env, school, [dispatchUser]);
+    if (result.error) {
       return jsonResp({
         ok: false,
-        error: "Missing GitHub token",
-        repo: school.repo,
-      }, 400);
-    }
-    const result = await dispatchGitHubVerbose(dispatchToken, school.repo, payload);
-    if (!result.ok) {
-      return jsonResp({
-        ok: false,
-        error: "GitHub dispatch failed",
-        status: result.status,
-        detail: result.detail,
+        error: result.error,
+        triggeredUsers: 1,
+        okBatches: result.okBatches,
+        totalBatches: result.totalBatches,
         repo: school.repo,
       }, 502);
     }
-    return jsonResp({ ok: true, slots: activeSlots.length, repo: school.repo });
+    return jsonResp({
+      ok: true,
+      triggeredUsers: 1,
+      okBatches: result.okBatches,
+      totalBatches: result.totalBatches,
+      slots: activeSlots.length,
+      repo: school.repo,
+    });
   }
 
   // POST /api/encrypt

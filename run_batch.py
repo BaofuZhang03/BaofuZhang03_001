@@ -159,11 +159,11 @@ def _run_one(user: dict, index: int, run_dir: pathlib.Path, payload: dict) -> di
         user.get("nickname")
         or user.get("nickName")
         or user.get("name")
-        or remark
         or username
         or f"user_{index + 1}"
     )
-    log_name = remark or nickname or username
+    display_name = nickname or remark or username
+    log_name = display_name
     log_path = run_dir / f"{index + 1:02d}_{_safe_name(log_name)}.log"
     env = os.environ.copy()
     dispatch_payload = _build_user_dispatch_payload(payload, user)
@@ -188,7 +188,7 @@ def _run_one(user: dict, index: int, run_dir: pathlib.Path, payload: dict) -> di
     return {
         "index": index + 1,
         "username": username,
-        "display_name": remark or nickname or username,
+        "display_name": display_name,
         "remark": remark,
         "nickname": nickname,
         "returncode": proc.returncode,
