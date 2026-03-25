@@ -7,7 +7,7 @@
 //
 // KV Schema (binding: SEAT_KV):
 //   schools                     → 学校 ID 列表 ["001", "002", "003"]
-//   school:{id}                 → 学校配置 { id, name, trigger_time, endtime, repo, github_token_key, strategy }
+//   school:{id}                 → 学校配置 { id, name, trigger_time, endtime, repo, github_token_key, dispatch_target, server_url, strategy }
 //   school:{id}:users           → 用户 ID 列表
 //   school:{id}:user:{userId}   → 单用户完整配置
 //
@@ -159,15 +159,29 @@ function resolveGitHubToken(env, school = null) {
   return normalizeSecretText(env?.GH_TOKEN);
 }
 
+function resolveServerApiKey(env, school = null) {
+  const schoolKey = normalizeSecretText(school?.server_api_key);
+  if (schoolKey) return schoolKey;
+  return normalizeSecretText(env?.SERVER_DISPATCH_API_KEY);
+}
+
+function resolveDispatchTarget(school = null) {
+  const raw = normalizeSecretText(school?.dispatch_target).toLowerCase();
+  return ["github", "server", "both"].includes(raw) ? raw : "github";
+}
+
 function sanitizeSchoolForClient(school) {
   if (!school || typeof school !== "object") return school;
   const hasGitHubToken = !!normalizeSecretText(school.github_token);
+  const hasServerApiKey = !!normalizeSecretText(school.server_api_key);
   const tokenKey = normalizeSecretText(school.github_token_key).toLowerCase();
-  const { github_token, ...rest } = school;
+  const { github_token, server_api_key, ...rest } = school;
   return {
     ...rest,
     github_token_key: tokenKey,
+    dispatch_target: resolveDispatchTarget(school),
     has_github_token: hasGitHubToken || !!tokenKey,
+    has_server_api_key: hasServerApiKey,
   };
 }
 
@@ -408,8 +422,12 @@ function defaultSchool(id, name) {
     fidEnc: "",
     reading_zone_groups: [],
     repo: `BAOfuZhan/${id}`,
+    dispatch_target: "github",
     github_token_key: "",
     github_token: "",
+    server_url: "",
+    server_api_key: "",
+    server_max_concurrency: 3,
     strategy: {
       mode: "C",
       submit_mode: "serial",
@@ -498,6 +516,44 @@ async function dispatchGitHubVerbose(token, repo, payload) {
     });
     const text = await res.text();
     return { ok: res.status === 204, status: res.status, detail: text };
+  } catch (e) {
+    return { ok: false, status: 0, detail: e.message || String(e) };
+  }
+}
+
+async function dispatchServer(url, apiKey, payload) {
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      "User-Agent": "TongYi-Worker",
+    };
+    if (apiKey) headers["X-API-Key"] = apiKey;
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("dispatchServer error:", e);
+    return false;
+  }
+}
+
+async function dispatchServerVerbose(url, apiKey, payload) {
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      "User-Agent": "TongYi-Worker",
+    };
+    if (apiKey) headers["X-API-Key"] = apiKey;
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, detail: text };
   } catch (e) {
     return { ok: false, status: 0, detail: e.message || String(e) };
   }
@@ -711,11 +767,23 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
 async function dispatchUsersInBatches(env, school, users) {
   const batches = chunkArray(users, BATCH_SIZE);
   const dispatchToken = resolveGitHubToken(env, school);
+  const dispatchTarget = resolveDispatchTarget(school);
+  const serverUrl = normalizeSecretText(school?.server_url);
+  const serverApiKey = resolveServerApiKey(env, school);
+  const serverMaxConcurrency = Math.max(
+    1,
+    parseInt(school?.server_max_concurrency, 10) || 3,
+  );
   let okBatches = 0;
+  const dispatchErrors = [];
 
-  if (!dispatchToken) {
+  if ((dispatchTarget === "github" || dispatchTarget === "both") && !dispatchToken) {
     console.log(`Dispatch skipped for school ${school.id}: missing GitHub token`);
     return { okBatches: 0, totalBatches: batches.length, error: "Missing GitHub token" };
+  }
+  if ((dispatchTarget === "server" || dispatchTarget === "both") && !serverUrl) {
+    console.log(`Dispatch skipped for school ${school.id}: missing server_url`);
+    return { okBatches: 0, totalBatches: batches.length, error: "Missing server_url" };
   }
 
   for (let i = 0; i < batches.length; i++) {
@@ -725,16 +793,40 @@ async function dispatchUsersInBatches(env, school, users) {
       trigger_date: beijingDate(),
       batch_index: i + 1,
       batch_total: batches.length,
+      dispatch_target: dispatchTarget,
+      server_max_concurrency: serverMaxConcurrency,
       users: batches[i].map(u => buildDispatchPayloadForUser(school, u)),
     };
-    const ok = await dispatchGitHub(dispatchToken, school.repo, payload);
-    if (ok) okBatches++;
+
+    let githubOk = true;
+    let serverOk = true;
+
+    if (dispatchTarget === "github" || dispatchTarget === "both") {
+      githubOk = await dispatchGitHub(dispatchToken, school.repo, payload);
+    }
+    if (dispatchTarget === "server" || dispatchTarget === "both") {
+      serverOk = await dispatchServer(serverUrl, serverApiKey, payload);
+    }
+
+    const ok = githubOk && serverOk;
+    if (ok) {
+      okBatches++;
+    } else {
+      dispatchErrors.push(
+        `batch ${i + 1}: github=${githubOk ? "ok" : "fail"}, server=${serverOk ? "ok" : "fail"}`
+      );
+    }
     console.log(
-      `Dispatch batch ${school.id} ${i + 1}/${batches.length}: ${ok ? "OK" : "FAIL"}`
+      `Dispatch batch ${school.id} ${i + 1}/${batches.length}: ${ok ? "OK" : "FAIL"} `
+      + `(target=${dispatchTarget}, github=${githubOk ? "ok" : "skip/fail"}, server=${serverOk ? "ok" : "skip/fail"})`
     );
   }
 
-  return { okBatches, totalBatches: batches.length };
+  return {
+    okBatches,
+    totalBatches: batches.length,
+    error: dispatchErrors.length ? dispatchErrors.join("; ") : "",
+  };
 }
 
 function parseSeatIdsRaw(seatidRaw) {
@@ -1036,10 +1128,18 @@ async function handleAPI(request, env, path) {
       school.conflict_group = normalizeSecretText(body.conflict_group);
     }
     if (body.repo) school.repo = body.repo;
+    if (body.dispatch_target !== undefined) {
+      school.dispatch_target = resolveDispatchTarget(body);
+    }
     if (body.github_token_key !== undefined) {
       school.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
     }
     if (body.github_token !== undefined) school.github_token = normalizeSecretText(body.github_token);
+    if (body.server_url !== undefined) school.server_url = normalizeSecretText(body.server_url);
+    if (body.server_api_key !== undefined) school.server_api_key = normalizeSecretText(body.server_api_key);
+    if (body.server_max_concurrency !== undefined) {
+      school.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 3);
+    }
     if (body.trigger_time) school.trigger_time = body.trigger_time;
     if (body.endtime) school.endtime = body.endtime;
     if (body.fidEnc !== undefined) school.fidEnc = body.fidEnc;
@@ -1083,8 +1183,20 @@ async function handleAPI(request, env, path) {
     if (body.github_token_key !== undefined) {
       body.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
     }
+    if (body.dispatch_target !== undefined) {
+      body.dispatch_target = resolveDispatchTarget(body);
+    }
     if (body.conflict_group !== undefined) {
       body.conflict_group = normalizeSecretText(body.conflict_group);
+    }
+    if (body.server_url !== undefined) {
+      body.server_url = normalizeSecretText(body.server_url);
+    }
+    if (body.server_api_key !== undefined) {
+      body.server_api_key = normalizeSecretText(body.server_api_key);
+    }
+    if (body.server_max_concurrency !== undefined) {
+      body.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 3);
     }
     Object.assign(school, body, { id: school.id });
     await saveSchool(KV, school);
@@ -2028,6 +2140,14 @@ function renderAddSchoolModal() {
             <input type="text" id="new_school_repo" placeholder="BAOfuZhan/hcd">
           </div>
           <div class="form-group">
+            <label>分发目标</label>
+            <select id="new_school_dispatch_target">
+              <option value="github">github - 仅 GitHub Actions</option>
+              <option value="server">server - 仅服务器直跑</option>
+              <option value="both">both - 同时发 GitHub 和服务器</option>
+            </select>
+          </div>
+          <div class="form-group">
             <label>冲突分组</label>
             <input type="text" id="new_school_conflict_group" placeholder="可留空；留空时优先按学校 fidEnc 自动归并">
           </div>
@@ -2041,6 +2161,20 @@ function renderAddSchoolModal() {
               <option value="d">D -> GH_TOKEN_D</option>
               <option value="e">E -> GH_TOKEN_E</option>
             </select>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>服务器分发地址</label>
+              <input type="text" id="new_school_server_url" placeholder="例如: https://your-server.example.com/dispatch">
+            </div>
+            <div class="form-group">
+              <label>服务器最大并发</label>
+              <input type="number" id="new_school_server_max_concurrency" value="3" min="1">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>服务器 API Key（可留空，优先使用 Worker 环境变量）</label>
+            <input type="text" id="new_school_server_api_key" placeholder="留空则回退到 Worker 环境变量 SERVER_DISPATCH_API_KEY">
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -2094,6 +2228,10 @@ function renderSchoolDetail() {
           <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
           <div><strong>冲突分组:</strong> \${s.conflict_group || (s.fidEnc ? "自动按 fidEnc" : (s.name || "-"))}</div>
+          <div><strong>分发目标:</strong> \${s.dispatch_target || "github"}</div>
+          <div><strong>服务器地址:</strong> \${s.server_url || "-"}</div>
+          <div><strong>服务器并发:</strong> \${s.server_max_concurrency || 3}</div>
+          <div><strong>服务器密钥:</strong> \${s.has_server_api_key ? "已配置" : "未配置/使用环境变量"}</div>
         </div>
       </div>
       <div class="card">
@@ -2210,6 +2348,14 @@ function renderEditSchoolModal() {
             </div>
           </div>
           <div class="form-group">
+            <label>分发目标</label>
+            <select id="edit_school_dispatch_target">
+              <option value="github" \${(!s.dispatch_target || s.dispatch_target==="github") ? "selected" : ""}>github - 仅 GitHub Actions</option>
+              <option value="server" \${s.dispatch_target==="server" ? "selected" : ""}>server - 仅服务器直跑</option>
+              <option value="both" \${s.dispatch_target==="both" ? "selected" : ""}>both - 同时发 GitHub 和服务器</option>
+            </select>
+          </div>
+          <div class="form-group">
             <label>GitHub 密匙槽位</label>
             <select id="edit_school_github_token_key">
               <option value="" \${!s.github_token_key ? "selected" : ""}>默认 GH_TOKEN</option>
@@ -2219,6 +2365,20 @@ function renderEditSchoolModal() {
               <option value="d" \${s.github_token_key==="d" ? "selected" : ""}>D -> GH_TOKEN_D</option>
               <option value="e" \${s.github_token_key==="e" ? "selected" : ""}>E -> GH_TOKEN_E</option>
             </select>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>服务器分发地址</label>
+              <input type="text" id="edit_school_server_url" value="\${s.server_url || ''}" placeholder="例如: https://your-server.example.com/dispatch">
+            </div>
+            <div class="form-group">
+              <label>服务器最大并发</label>
+              <input type="number" id="edit_school_server_max_concurrency" value="\${s.server_max_concurrency || 3}" min="1">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>服务器 API Key（留空则保留已有值；使用 ****** 表示不改）</label>
+            <input type="text" id="edit_school_server_api_key" value="" placeholder="\${s.has_server_api_key ? '已配置，留空不修改' : '留空则使用 Worker 环境变量 SERVER_DISPATCH_API_KEY'}">
           </div>
           <div class="form-group">
             <label>冲突分组</label>
@@ -2446,8 +2606,12 @@ async function doAddSchool() {
   const id = document.getElementById("new_school_id").value.trim();
   const name = document.getElementById("new_school_name").value.trim();
   const repo = document.getElementById("new_school_repo").value.trim();
+  const dispatch_target = document.getElementById("new_school_dispatch_target").value.trim().toLowerCase();
   const conflict_group = document.getElementById("new_school_conflict_group").value.trim();
   const github_token_key = document.getElementById("new_school_github_token_key").value.trim().toLowerCase();
+  const server_url = document.getElementById("new_school_server_url").value.trim();
+  const server_api_key = document.getElementById("new_school_server_api_key").value.trim();
+  const server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 3;
   const trigger_time = document.getElementById("new_school_trigger").value.trim();
   const endtime = document.getElementById("new_school_endtime").value.trim();
   const fidEnc = document.getElementById("new_school_fidEnc").value.trim();
@@ -2456,8 +2620,12 @@ async function doAddSchool() {
     id,
     name,
     repo,
+    dispatch_target,
     conflict_group,
     github_token_key,
+    server_url,
+    server_api_key,
+    server_max_concurrency,
     trigger_time,
     endtime,
     fidEnc,
@@ -2516,6 +2684,10 @@ function showEditSchool() {
 async function doEditSchool() {
   const s = currentSchool;
   const githubTokenKey = document.getElementById("edit_school_github_token_key").value.trim().toLowerCase();
+  const dispatchTarget = document.getElementById("edit_school_dispatch_target").value.trim().toLowerCase();
+  const serverUrl = document.getElementById("edit_school_server_url").value.trim();
+  const serverApiKeyInput = document.getElementById("edit_school_server_api_key").value.trim();
+  const serverMaxConcurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 3;
   const burstOffsetsText = document.getElementById("edit_strategy_burst").value;
   const burstOffsets = burstOffsetsText
     .split(",")
@@ -2547,8 +2719,11 @@ async function doEditSchool() {
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
+    dispatch_target: dispatchTarget,
     conflict_group: document.getElementById("edit_school_conflict_group").value.trim(),
     github_token_key: githubTokenKey,
+    server_url: serverUrl,
+    server_max_concurrency: serverMaxConcurrency,
     trigger_time: document.getElementById("edit_school_trigger").value.trim(),
     endtime: document.getElementById("edit_school_endtime").value.trim(),
     fidEnc: document.getElementById("edit_school_fidEnc").value.trim(),
@@ -2571,6 +2746,9 @@ async function doEditSchool() {
       burst_jitter_range_ms: burstJitterRange,
     }
   };
+  if (serverApiKeyInput && serverApiKeyInput !== "******") {
+    body.server_api_key = serverApiKeyInput;
+  }
   const res = await api("PUT", "/api/school/" + s.id, body);
   if (res.ok) {
     toast("配置已保存");
